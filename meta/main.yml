@@ -1,0 +1,18 @@
+---
+galaxy_info:
+  role_name: ludus_detonator_agent
+  author: curi0xity
+  description: Install and run DetonatorAgent (.NET 8) on a Windows analysis VM for Ludus.
+  license: MIT
+  min_ansible_version: "2.12"
+  platforms:
+    - name: Windows
+      versions:
+        - all
+  galaxy_tags:
+    - ludus
+    - detonator
+    - edr
+    - redteam
+    - windows
+dependencies: []

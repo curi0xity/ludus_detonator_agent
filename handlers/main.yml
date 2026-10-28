@@ -1,0 +1,2 @@
+---
+# no handlers: the reboot + logon-triggered task starts the agent cleanly.

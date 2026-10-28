@@ -1,0 +1,521 @@
+---
+# NOTE: Defender is intentionally left ENABLED. The agent's default EDR plugin
+# reads Defender's telemetry, so disabling it would defeat the purpose.
+
+- name: Fail early if autologon is enabled without a password
+  ansible.builtin.assert:
+    that: ludus_detonator_agent_autologon_password | length > 0
+    fail_msg: "Set ludus_detonator_agent_autologon_password (the Windows {{ ludus_detonator_agent_autologon_user }} password)."
+  when: ludus_detonator_agent_run_at_logon | bool
+  tags: [detonator_agent, always]
+
+- name: Fail early if RedEdr is enabled without a release URL
+  ansible.builtin.assert:
+    that: ludus_detonator_agent_rededr_release_url | length > 0
+    fail_msg: "Set ludus_detonator_agent_rededr_release_url to a RedEdr release .zip, or set ludus_detonator_agent_install_rededr: false."
+  when: ludus_detonator_agent_install_rededr | bool
+  tags: [detonator_agent, always]
+
+- name: Ensure Defender real-time protection is enabled (EDR source for the agent)
+  ansible.windows.win_shell: Set-MpPreference -DisableRealtimeMonitoring $false
+  when: ludus_detonator_agent_edr == 'defender'
+  changed_when: false
+  failed_when: false   # tamper protection can block this; warn, don't fail deploy
+  tags: [detonator_agent, defender]
+
+- name: Install dependencies via Chocolatey
+  chocolatey.chocolatey.win_chocolatey:
+    name: "{{ _det_choco_pkgs }}"
+    state: present
+  vars:
+    _det_choco_pkgs: >-
+      {{ ['git', ludus_detonator_agent_dotnet_choco_pkg]
+         + (['autoit'] if ludus_detonator_agent_install_autoit | bool else []) }}
+  tags: [detonator_agent, install, dependencies]
+
+- name: Refresh connection so Chocolatey PATH updates (git) are visible
+  ansible.builtin.meta: reset_connection
+
+- name: Ensure install dir exists
+  ansible.windows.win_file:
+    path: "{{ ludus_detonator_agent_install_dir }}"
+    state: directory
+  tags: [detonator_agent, install]
+
+# ponytail: plain clone, no --branch. repo_version is a commit SHA and
+# `git clone --branch <sha>` is not valid git -- the force-checkout below pins it.
+- name: Clone DetonatorAgent repo
+  ansible.windows.win_command: >-
+    git clone {{ ludus_detonator_agent_repo_url }}
+    "{{ ludus_detonator_agent_install_dir }}"
+  args:
+    creates: "{{ ludus_detonator_agent_install_dir }}\\.git"
+  tags: [detonator_agent, install]
+
+# The agent runs out of publish\\ and holds its own DLLs open, so `git clean -fdx`
+# below dies with "failed to remove ...: Invalid argument" on every converge run
+# -- after it has already deleted the rest of publish\\, leaving a broken agent.
+# Stop it first; the reboot at the end of this role restarts it via the logon task.
+# One Stop-Process + 2s was NOT enough: the 2026-10-26 converge still died at the
+# checkout below with `failed to remove publish/*.dll: Invalid argument` (git's
+# error for a file still mapped, not a permissions one). Windows releases the
+# mapped-file handles asynchronously after the process dies, and the scheduled
+# task carries restart_count 3 / restart_interval PT1M, so a single shot can also
+# race a restart. Disable the task first, then kill until nothing matches, then
+# give the handles a moment.
+- name: Stop a running DetonatorAgent so its DLLs are not locked
+  ansible.windows.win_shell: |
+    Disable-ScheduledTask -TaskName "{{ ludus_detonator_agent_task_name }}" -ErrorAction SilentlyContinue | Out-Null
+    Stop-ScheduledTask -TaskName "{{ ludus_detonator_agent_task_name }}" -ErrorAction SilentlyContinue
+    foreach ($i in 1..10) {
+        $p = @(Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe'" -ErrorAction SilentlyContinue |
+               Where-Object { $_.CommandLine -like '*{{ ludus_detonator_agent_dll }}*' })
+        if ($p.Count -eq 0) { break }
+        $p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Seconds 2
+    }
+    Start-Sleep -Seconds 3
+  changed_when: false
+  failed_when: false
+  tags: [detonator_agent, install]
+
+- name: Force checkout to pinned version (clean working tree)
+  ansible.windows.win_shell: |
+    git fetch --all
+    git reset --hard {{ ludus_detonator_agent_repo_version }}
+    git clean -fdx
+  args:
+    chdir: "{{ ludus_detonator_agent_install_dir }}"
+  register: _det_git_pull
+  changed_when: true
+  tags: [detonator_agent, install]
+
+# --- Local patches ---------------------------------------------------------
+# We carry fixes against the pinned upstream here rather than forking the repo:
+# the force-checkout above runs `git reset --hard` + `git clean -fdx` every
+# converge, so each patch must re-apply each run (and that reset is what makes a
+# plain in-place edit safe -- it is always applied to pristine upstream).
+#
+# clickfix: `AutoItX.Send(cmd)` runs in the default send mode, where ! ^ + # { }
+# are interpreted as modifier keys -- so any real command containing them (e.g.
+# `powershell -c {...}`) is silently mangled into keystrokes. Flag 1 ($SEND_RAW)
+# sends the string literally. The two neighbouring Send() calls are deliberate
+# key sequences (#r, {ENTER}) and must stay in default mode, so target only the
+# cmd line. failed_when guards a pin bump: if the exact line is gone, fail loud
+# rather than ship the bug silently.
+- name: "Patch (clickfix): send the command raw so AutoIt modifier chars survive"
+  ansible.windows.win_shell: |
+    $f = "{{ ludus_detonator_agent_install_dir }}\Services\WindowsExecutionServiceClickfix.cs"
+    $c = Get-Content -Raw -LiteralPath $f
+    if ($c -match [regex]::Escape('AutoItX.Send(cmd, 1);')) {
+        'already-patched'
+    } elseif ($c -match [regex]::Escape('AutoItX.Send(cmd);')) {
+        $c = $c -replace [regex]::Escape('AutoItX.Send(cmd);'), 'AutoItX.Send(cmd, 1);'
+        Set-Content -LiteralPath $f -Value $c -NoNewline
+        'patched'
+    } else {
+        'MISSING'
+    }
+  register: _det_patch_clickfix
+  changed_when: "'patched' in _det_patch_clickfix.stdout"
+  failed_when: "'MISSING' in _det_patch_clickfix.stdout"
+  tags: [detonator_agent, build, patch]
+
+# autoit: the agent only looks for a block dialog when the process did NOT start,
+# and only recognises it when the window TITLE contains the dropped filename --
+# true for Defender's block dialog, false for both MOTW ones ("Open File -
+# Security Warning", "Windows protected your PC"). Those therefore read as a
+# generic "Could not confirm that Explorer started X", indistinguishable from a
+# timing miss. Log the probe BEFORE the handle==0 early return, so "no dialog at
+# all" and "a dialog we do not recognise" are distinguishable -- logging only the
+# title cannot tell them apart, which is exactly what the first MOTW run hit.
+# [CLASS:#32770] is the classic Win32 dialog only; Win11's SmartScreen prompt
+# ("Windows protected your PC") is XAML and has handle 0 here. A modal block is
+# the ACTIVE window whatever its class, so log that title too -- it is the only
+# thing in this probe that can see a SmartScreen gate.
+# Behaviour unchanged: it still only dismisses the filename-titled dialog.
+- name: "Patch (autoit): log which dialog appeared, not just that one did"
+  ansible.windows.win_shell: |
+    $f = "{{ ludus_detonator_agent_install_dir }}\Services\WindowsExecutionServiceAutoit.cs"
+    $c = Get-Content -Raw -LiteralPath $f
+    $old = '        var dialogHandle = AutoItX.WinGetHandle("[CLASS:#32770]");'
+    $new = $old + "`n" + '        _logger.LogInformation("Dialog probe: handle={Handle} title={Title} active={Active}", dialogHandle, dialogHandle == 0 ? "(none)" : AutoItX.WinGetTitle(dialogHandle), AutoItX.WinGetTitle("[ACTIVE]"));'
+    if ($c.Contains('Dialog probe:')) {
+        'already-patched'
+    } elseif ($c.Contains($old)) {
+        Set-Content -LiteralPath $f -Value $c.Replace($old, $new) -NoNewline
+        'patched'
+    } else {
+        'MISSING'
+    }
+  register: _det_patch_dialog_title
+  changed_when: "'patched' in _det_patch_dialog_title.stdout"
+  failed_when: "'MISSING' in _det_patch_dialog_title.stdout"
+  tags: [detonator_agent, build, patch]
+
+# autoit: the simulated double-click never actually ran the payload. Upstream
+# does Win+E, wait 1.5s, Alt+D, type the directory, Enter, type the filename,
+# Enter -- every step after that wait assumes a painted, focused Explorer. On
+# win11-25h2 with 2 vCPU it is not: the ACTIVE-window probe logged
+# `active=Home - File Explorer` twelve seconds in, so the keystrokes went to the
+# Home view. Cross-checked against Elastic: zero process-start events for EVERY
+# autoit run on record, including msf_test.exe, which alerts within seconds when
+# it does run. So `-e autoit` has been scoring payloads that never executed.
+#
+# First fix attempt was `explorer.exe /select,"<file>"` + one Enter. It got the
+# navigation right (`active=Downloads - File Explorer`) and STILL did not launch:
+# file creation in Elastic, no process event, no dialog. Any keystroke-based
+# launch is a focus race we keep losing, so drop the keyboard entirely and let
+# the shell do it.
+- name: "Patch (autoit): launch via the shell, not a keystroke that needs focus"
+  ansible.windows.win_shell: |
+    $f = "{{ ludus_detonator_agent_install_dir }}\Services\WindowsExecutionServiceAutoit.cs"
+    # git checks the file out with CRLF, and a multi-line -join "`n" needle never
+    # matches that. The single-line patches above are immune; this one is not.
+    $c = (Get-Content -Raw -LiteralPath $f) -replace "`r`n", "`n"
+    $old = @(
+        '        // Open Explorer using Win+E shortcut, then navigate to the directory',
+        '        AutoItX.Send("#e"); // Win+E to open Explorer',
+        '        await Task.Delay(WAIT_EXPLORER_OPENING); // Wait for Explorer to open',
+        '        ',
+        '        // Get the active window handle (the Explorer window that just opened)',
+        '        nint activeWindowHandle = AutoItX.WinGetHandle("[ACTIVE]");',
+        '        if (activeWindowHandle == 0) {',
+        '            // Fallback: try to find the most recent Explorer window by class',
+        '            _logger.LogWarning("Could not get active window handle, trying by class");',
+        '            activeWindowHandle = AutoItX.WinGetHandle("[CLASS:CabinetWClass]");',
+        '        }',
+        '        // Check active window handle again',
+        '        if (activeWindowHandle == 0) {',
+        '            _logger.LogWarning("Could not get active window handle for Explorer");',
+        '            return 0;',
+        '        }',
+        '        lock (_processLock) {',
+        '            _lastExplorerWindowHandle = activeWindowHandle;',
+        '        }',
+        '',
+        '        // Instrument the opened explorer',
+        '',
+        '        // Navigate to the directory by typing the path in the address bar',
+        '        AutoItX.Send("!d"); // Alt+D to focus address bar',
+        '        await Task.Delay(WAIT_EXPLORER_NAVIGATION);',
+        '        AutoItX.Send(directory); // Type the directory path',
+        '        await Task.Delay(WAIT_SHORT);',
+        '        AutoItX.Send("{ENTER}"); // Press Enter to navigate',
+        '        await Task.Delay(WAIT_SHORT);',
+        '',
+        '        // Select the file by typing its name',
+        '        AutoItX.Send(fileName);',
+        '        await Task.Delay(WAIT_SHORT);',
+        '',
+        '        // Send Enter key to open the selected file',
+        '        AutoItX.Send("{ENTER}");',
+        '        // Wait for the file to start executing',
+        '        await Task.Delay(WAIT_SHORT);',
+        ''
+    ) -join "`n"
+    $new = @(
+        '        // `explorer.exe "<file>"` ShellExecutes it: the already-running shell',
+        '        // launches the payload, so explorer.exe is the parent -- exactly what a',
+        '        // double-click produces. The two sequences this replaces both depended on',
+        '        // keyboard focus and both failed silently on win11-25h2: Win+E + Alt+D sent',
+        '        // its keystrokes to the Home view, and explorer /select + Enter opened the',
+        '        // right folder with the file highlighted and still never launched it',
+        '        // (Elastic recorded the file creation and no process event at all).',
+        '        // Dropping the keyboard removes the entire failure class. ShellExecute',
+        '        // still runs the zone check, so a MOTW / SmartScreen gate stays observable.',
+        '        _logger.LogInformation("ShellExecuting via explorer.exe: {FilePath}", filePath);',
+        '        AutoItX.Run("explorer.exe \"" + filePath + "\"", directory, SW_SHOW);',
+        '        await Task.Delay(WAIT_EXPLORER_OPENING);'
+    ) -join "`n"
+    if ($c.Contains('ShellExecuting via explorer.exe')) {
+        'already-patched'
+    } elseif ($c.Contains($old)) {
+        Set-Content -LiteralPath $f -Value $c.Replace($old, $new) -NoNewline
+        'patched'
+    } else {
+        'MISSING'
+    }
+  register: _det_patch_autoit_shell
+  changed_when: "'patched' in _det_patch_autoit_shell.stdout"
+  failed_when: "'MISSING' in _det_patch_autoit_shell.stdout"
+  tags: [detonator_agent, build, patch]
+
+# autoit: "no PID" aborts the submission before any alert is collected, so a
+# payload that runs and exits faster than the ~1.5s name lookup is scored as a
+# harness failure rather than measured. Name-based lookup cannot see a process
+# that already exited, which is every benign control we have. The block-dialog
+# probe above still runs first and still returns "virus", so a real AV block is
+# unaffected; this only changes the ambiguous case from "abort" to "run the
+# window and let the EDR answer". explain-report.py asks Elastic whether a
+# process actually started whenever a run reports zero alerts, so a payload that
+# genuinely never launched can no longer pass as evasion.
+- name: "Patch (autoit): an unconfirmed PID is not a failed run"
+  ansible.windows.win_shell: |
+    $f = "{{ ludus_detonator_agent_install_dir }}\Services\WindowsExecutionServiceAutoit.cs"
+    $c = Get-Content -Raw -LiteralPath $f
+    $old = 'return (false, 0, "Could not confirm execution after Explorer opened the file");'
+    $new = 'return (true, 0, "Could not confirm execution after Explorer opened the file");'
+    if ($c.Contains($new)) {
+        'already-patched'
+    } elseif ($c.Contains($old)) {
+        Set-Content -LiteralPath $f -Value $c.Replace($old, $new) -NoNewline
+        'patched'
+    } else {
+        'MISSING'
+    }
+  register: _det_patch_autoit_pid
+  changed_when: "'patched' in _det_patch_autoit_pid.stdout"
+  failed_when: "'MISSING' in _det_patch_autoit_pid.stdout"
+  tags: [detonator_agent, build, patch]
+
+# motw: a browser download leaves a Zone.Identifier stream behind; nothing in the
+# Detonator path does, so every detonation so far has tested the no-MOTW case
+# only. The flag rides on the execution_mode string ("autoit:motw") because that
+# string is ALREADY plumbed server->agent and recorded in the report. A real form
+# field would cost an API parameter, a DB column and a CLI flag for one boolean.
+# ponytail: suffix on the mode string; promote it if MOTW ever needs to combine
+# with a second such option.
+- name: "Patch (motw): optional Zone.Identifier on the dropped file"
+  ansible.windows.win_shell: |
+    $f = "{{ ludus_detonator_agent_install_dir }}\Controllers\ExecuteController.cs"
+    $c = Get-Content -Raw -LiteralPath $f
+    $oldResolve = '            var executionService = ResolveExecutionService(execution_mode);'
+    $newResolve = @(
+        '            // "autoit:motw" == mode autoit + a Mark of the Web on the dropped file.',
+        '            var dropMotw = execution_mode != null && execution_mode.EndsWith(":motw", StringComparison.OrdinalIgnoreCase);',
+        '            if (dropMotw) {',
+        '                execution_mode = execution_mode!.Substring(0, execution_mode.Length - 5);',
+        '            }',
+        $oldResolve
+    ) -join "`n"
+    $oldStart = '            // Start the malware'
+    $newStart = @(
+        '            // Written AFTER the content, which is the order a browser does it in.',
+        '            // ZoneId=3 = Internet. HostUrl is what SmartScreen reputation sees.',
+        '            // For -e autoit with a zip this is enough: Explorer does the extracting',
+        '            // and propagates the zone to the extracted files. For -e exec with a zip',
+        '            // the agent already extracted and DELETED the archive inside WriteFile,',
+        '            // so there is nothing left to mark -- that case logs a skip.',
+        '            if (dropMotw) {',
+        '                try {',
+        '                    if (System.IO.File.Exists(filePath)) {',
+        '                        System.IO.File.WriteAllText(filePath + ":Zone.Identifier",',
+        '                            "[ZoneTransfer]\r\nZoneId=3\r\nReferrerUrl=https://cdn.example.com/\r\nHostUrl=https://cdn.example.com/" + Path.GetFileName(filePath) + "\r\n");',
+        '                        _logger.LogInformation("Exec: wrote MOTW ZoneId=3 to {FilePath}", filePath);',
+        '                    } else {',
+        '                        _logger.LogWarning("Exec: MOTW requested but {FilePath} is gone (archive extracted and deleted); nothing marked", filePath);',
+        '                    }',
+        '                } catch (Exception motwEx) {',
+        '                    _logger.LogError(motwEx, "Exec: failed to write MOTW to {FilePath}", filePath);',
+        '                }',
+        '            }',
+        '',
+        $oldStart
+    ) -join "`n"
+    if ($c.Contains('dropMotw')) {
+        'already-patched'
+    } elseif ($c.Contains($oldResolve) -and $c.Contains($oldStart)) {
+        $c = $c.Replace($oldResolve, $newResolve).Replace($oldStart, $newStart)
+        Set-Content -LiteralPath $f -Value $c -NoNewline
+        'patched'
+    } else {
+        'MISSING'
+    }
+  register: _det_patch_motw
+  changed_when: "'patched' in _det_patch_motw.stdout"
+  failed_when: "'MISSING' in _det_patch_motw.stdout"
+  tags: [detonator_agent, build, patch]
+
+- name: Re-enable the agent task that the stop step disabled
+  ansible.windows.win_shell: Enable-ScheduledTask -TaskName "{{ ludus_detonator_agent_task_name }}" -ErrorAction SilentlyContinue | Out-Null
+  changed_when: false
+  failed_when: false
+  tags: [detonator_agent, install]
+
+- name: Publish DetonatorAgent (framework-dependent, win-x64)
+  ansible.windows.win_command: >-
+    "{{ ludus_detonator_agent_dotnet_exe }}" publish "{{ ludus_detonator_agent_project }}"
+    -c Release -r win-x64 --self-contained false
+    -o "{{ ludus_detonator_agent_publish_dir }}"
+  args:
+    chdir: "{{ ludus_detonator_agent_install_dir }}"
+  register: _det_publish
+  changed_when: _det_publish.rc == 0
+  tags: [detonator_agent, build]
+
+# --- RedEdr ----------------------------------------------------------------
+- name: Install RedEdr
+  when: ludus_detonator_agent_install_rededr | bool
+  tags: [detonator_agent, rededr]
+  block:
+    - name: Download RedEdr release
+      ansible.windows.win_get_url:
+        url: "{{ ludus_detonator_agent_rededr_release_url }}"
+        dest: 'C:\Windows\Temp\RedEdr.zip'
+
+    - name: Extract RedEdr
+      community.windows.win_unzip:
+        src: 'C:\Windows\Temp\RedEdr.zip'
+        dest: "{{ ludus_detonator_agent_rededr_install_dir }}"
+        creates: "{{ ludus_detonator_agent_rededr_install_dir }}\\{{ ludus_detonator_agent_rededr_exe }}"
+
+    - name: Run RedEdr at logon (elevated, interactive session)
+      community.windows.win_scheduled_task:
+        name: RedEdr
+        description: "RedEdr ETW/ETW-TI event collector"
+        actions:
+          - path: "{{ ludus_detonator_agent_rededr_install_dir }}\\{{ ludus_detonator_agent_rededr_exe }}"
+            working_directory: "{{ ludus_detonator_agent_rededr_install_dir }}"
+        triggers:
+          - type: logon
+        username: "{{ ludus_detonator_agent_autologon_user }}"
+        logon_type: interactive_token
+        # Task Scheduler's DEFAULT ExecutionTimeLimit is PT72H, and it applies to a
+        # process you intend to run forever: it terminated the agent after 3 days with
+        # 0x41306 SCHED_S_TASK_TERMINATED, port 8080 went dead, and with RestartCount 0
+        # nothing brought it back. Submissions then hung in `processing` against an
+        # agent that would never answer. Measured on a win11-edr target.
+        execution_time_limit: PT0S          # no limit -- this is a daemon
+        restart_count: 3                    # and if it does die, try to recover
+        restart_interval: PT1M
+        runlevel: highest
+        state: present
+        enabled: true
+
+# --- Firewall --------------------------------------------------------------
+- name: Open firewall for agent (and RedEdr) ports
+  community.windows.win_firewall_rule:
+    name: "DetonatorAgent {{ item }}"
+    localport: "{{ item }}"
+    action: allow
+    direction: in
+    protocol: tcp
+    state: present
+    enabled: true
+  loop: "{{ [ludus_detonator_agent_port] + ([ludus_detonator_agent_rededr_port] if ludus_detonator_agent_install_rededr | bool else []) }}"
+  when: ludus_detonator_agent_open_firewall | bool
+  tags: [detonator_agent, firewall]
+
+# --- Guest clock -----------------------------------------------------------
+- name: Keep the guest clock correct across snapshot reverts
+  when: ludus_detonator_agent_time_source_url | length > 0
+  tags: [detonator_agent, timesync]
+  block:
+    - name: Ensure timesync dir exists
+      ansible.windows.win_file:
+        path: "{{ ludus_detonator_agent_timesync_dir }}"
+        state: directory
+
+    - name: Deploy timesync script
+      ansible.windows.win_copy:
+        dest: "{{ ludus_detonator_agent_timesync_dir }}\\timesync.ps1"
+        content: |
+          # curl.exe, not Invoke-WebRequest: Schannel/.NET 4.x on this image cannot
+          # negotiate TLS with the Elastic stack, curl ships its own TLS.
+          $h = & C:\Windows\System32\curl.exe -sk -i --max-time 10 "{{ ludus_detonator_agent_time_source_url }}" 2>$null
+          $line = $h | Select-String "^Date:\s*(.+)$" | Select-Object -First 1
+          if ($line) {
+              $utc = [datetime]::ParseExact($line.Matches[0].Groups[1].Value.Trim(),
+                  "ddd, dd MMM yyyy HH:mm:ss 'GMT'", [Globalization.CultureInfo]::InvariantCulture,
+                  [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal)
+              $skew = ((Get-Date).ToUniversalTime() - $utc).TotalSeconds
+              if ([math]::Abs($skew) -gt 2) {
+                  Set-Date -Date $utc.ToLocalTime() | Out-Null
+                  "$(Get-Date -Format o) resynced, skew was $([math]::Round($skew,1))s" |
+                      Add-Content "{{ ludus_detonator_agent_timesync_dir }}\\timesync.log"
+              }
+          }
+
+    # Repeating (not at-logon): a snapshot resume fires no boot and no logon.
+    # Trigger must be daily+repetition, NOT registration+repetition: a
+    # registration trigger is a one-off instant, so after a reboot its
+    # repetition never re-arms (NextRunTime goes empty) and the clock stops
+    # self-healing. A daily window re-arms every day and survives both a reboot
+    # and a snapshot resume. start_boundary is deliberately far in the past so a
+    # clock rewind cannot land before it.
+    - name: Register repeating timesync task
+      community.windows.win_scheduled_task:
+        name: DetonatorTimeSync
+        description: "Resync guest clock after snapshot revert (no NTP in range)"
+        actions:
+          - path: powershell.exe
+            arguments: >-
+              -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden
+              -File "{{ ludus_detonator_agent_timesync_dir }}\\timesync.ps1"
+        triggers:
+          - type: daily
+            start_boundary: '2020-01-01T00:00:00'
+            repetition:
+              interval: PT1M
+              duration: P1D
+        username: SYSTEM
+        logon_type: service_account
+        runlevel: highest
+        start_when_available: true
+        execution_time_limit: PT2M
+        state: present
+        enabled: true
+
+# --- Interactive autostart -------------------------------------------------
+# DefaultDomainName must be the COMPUTER name for a local account. On a
+# domain-joined host, leaving it unset makes Windows try the AD domain, autologon
+# silently fails, no interactive session starts, and the agent never comes up --
+# which looks identical to a broken build. Correct on standalone hosts too.
+- name: Enable autologon for the analysis user
+  community.windows.win_auto_logon:
+    username: "{{ ludus_detonator_agent_autologon_user }}"
+    password: "{{ ludus_detonator_agent_autologon_password }}"
+  # Must carry the same condition as the DefaultDomainName write below: enabling
+  # autologon WITHOUT that write is the silent domain-resolution failure the
+  # comment above describes, so the two have to switch together.
+  when: ludus_detonator_agent_run_at_logon | bool
+  tags: [detonator_agent, autostart]
+
+# win_auto_logon has no `domain` parameter (username/password/state/logon_count
+# only), so DefaultDomainName has to be written directly.
+- name: Point autologon at the local account, not the domain
+  ansible.windows.win_regedit:
+    path: 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    name: DefaultDomainName
+    data: "{{ ludus_detonator_agent_autologon_domain | default(ansible_hostname, true) }}"
+    type: string
+  when: ludus_detonator_agent_run_at_logon | bool
+  tags: [detonator_agent, autostart]
+
+- name: Run DetonatorAgent at logon (interactive desktop session)
+  community.windows.win_scheduled_task:
+    name: "{{ ludus_detonator_agent_task_name }}"
+    description: "DetonatorAgent - executes redteam artifacts and collects EDR logs"
+    actions:
+      - path: "{{ ludus_detonator_agent_dotnet_exe }}"
+        arguments: >-
+          "{{ ludus_detonator_agent_publish_dir }}\{{ ludus_detonator_agent_dll }}"
+          --port {{ ludus_detonator_agent_port }} --edr={{ ludus_detonator_agent_edr }}
+        working_directory: "{{ ludus_detonator_agent_publish_dir }}"
+    triggers:
+      - type: logon
+    # Qualify with the computer name: a bare username on a domain-joined host
+    # resolves against the domain first and the task binds to the wrong principal.
+    username: "{{ ludus_detonator_agent_autologon_domain | default(ansible_hostname, true) }}\\{{ ludus_detonator_agent_autologon_user }}"
+    logon_type: interactive_token
+    # Task Scheduler's DEFAULT ExecutionTimeLimit is PT72H, and it applies to a
+    # process you intend to run forever: it terminated the agent after 3 days with
+    # 0x41306 SCHED_S_TASK_TERMINATED, port 8080 went dead, and with RestartCount 0
+    # nothing brought it back. Submissions then hung in `processing` against an
+    # agent that would never answer. Measured on a win11-edr target.
+    execution_time_limit: PT0S          # no limit -- this is a daemon
+    restart_count: 3                    # and if it does die, try to recover
+    restart_interval: PT1M
+    state: present
+    enabled: true
+  when: ludus_detonator_agent_run_at_logon | bool
+  tags: [detonator_agent, autostart]
+
+- name: Reboot so autologon starts the interactive session and agent
+  ansible.windows.win_reboot:
+    reboot_timeout: 600
+  when:
+    - ludus_detonator_agent_run_at_logon | bool
+    - ludus_detonator_agent_reboot | bool
+  tags: [detonator_agent, autostart]

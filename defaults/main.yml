@@ -1,0 +1,59 @@
+---
+# DetonatorAgent install location on the Windows VM
+ludus_detonator_agent_install_dir: 'C:\Tools\DetonatorAgent'
+ludus_detonator_agent_publish_dir: 'C:\Tools\DetonatorAgent\publish'
+ludus_detonator_agent_repo_url: 'https://github.com/dobin/DetonatorAgent.git'
+# ponytail: pinned to pre-FlaUI-5.0 commit; HEAD (909a43b) has broken FlaUI 5.0 .NET8 compat
+ludus_detonator_agent_repo_version: '83b8f3d'
+
+# .csproj lives at the repo root; dotnet auto-detects it from the repo dir.
+ludus_detonator_agent_project: 'DetonatorAgent.csproj'
+ludus_detonator_agent_dll: 'DetonatorAgent.dll'
+# Path to the .NET host (Chocolatey's default SDK location).
+ludus_detonator_agent_dotnet_exe: 'C:\Program Files\dotnet\dotnet.exe'
+
+# Chocolatey package for the .NET 8 SDK (agent requires .NET 8.0 SDK + ASP.NET)
+ludus_detonator_agent_dotnet_choco_pkg: 'dotnet-8.0-sdk'
+
+# Runtime
+ludus_detonator_agent_port: 8080
+ludus_detonator_agent_edr: 'defender'   # defender (default) | fibratus | logfile | none
+ludus_detonator_agent_task_name: 'DetonatorAgent'
+
+# --- Interactive execution -------------------------------------------------
+# autoit/clickfix execution modes simulate a logged-in user clicking, so the
+# agent must run in an interactive desktop session (a session-0 service can't).
+# We enable autologon and start the agent via a logon-triggered scheduled task.
+ludus_detonator_agent_run_at_logon: true
+ludus_detonator_agent_autologon_user: 'localuser'
+ludus_detonator_agent_autologon_password: 'password'   # Ludus localuser default; override per VM
+# Domain/computer name for the autologon principal. Empty = use the computer
+# name (ansible_hostname), which is what a LOCAL account needs -- on a
+# domain-joined host an unset value makes Windows try the AD domain and
+# autologon fails silently. Set explicitly only to log on as a DOMAIN user.
+ludus_detonator_agent_autologon_domain: ''
+ludus_detonator_agent_reboot: true             # reboot so autologon starts the session + agent
+
+# AutoIt is required for the 'autoit' execution mode (user-like clicking)
+ludus_detonator_agent_install_autoit: true
+
+# Open the agent port (and RedEdr port) in the Windows firewall
+ludus_detonator_agent_open_firewall: true
+
+# --- RedEdr (ETW / ETW-TI event collector) --------------------------------
+# Off by default: get Defender-local collection working first, then flip this on.
+ludus_detonator_agent_install_rededr: false
+ludus_detonator_agent_rededr_install_dir: 'C:\RedEdr'
+ludus_detonator_agent_rededr_port: 8081
+ludus_detonator_agent_rededr_exe: 'RedEdr.exe'
+# URL to a RedEdr release .zip (github.com/dobin/RedEdr releases). REQUIRED when
+# install_rededr is true. ponytail: exact asset name differs per release; set it.
+ludus_detonator_agent_rededr_release_url: ''
+
+# --- Guest clock -----------------------------------------------------------
+# A Proxmox snapshot revert rewinds the guest clock to snapshot-creation time,
+# and Ludus ranges have no NTP server, so EDR event timestamps drift minutes out
+# of the submission window. A repeating task steals the time from this URL's HTTP
+# Date header (Kibana works; Elasticsearch sends no Date header). Empty = skip.
+ludus_detonator_agent_time_source_url: ''
+ludus_detonator_agent_timesync_dir: 'C:\Tools\TimeSync'
