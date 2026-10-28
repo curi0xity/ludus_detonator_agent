@@ -211,3 +211,7 @@ mode produces verdicts for payloads that never ran.
 ## License
 
 MIT. DetonatorAgent, Detonator and RedEdr are dobin's, under their own licenses.
+
+## Acknowledgments
+
+Thanks to [dobin](https://github.com/dobin) and [Erik Hunstad](https://ludus.cloud/about) for making testing of payloads easier.
