@@ -1,4 +1,5 @@
 # ludus_detonator_agent
+:warning: Various parts of the code are written by Claude. Use at own risk.
 
 An [Ludus](https://ludus.cloud) Ansible role that turns a Windows VM into a
 detonation target for [**dobin/detonator**](https://github.com/dobin/detonator):
